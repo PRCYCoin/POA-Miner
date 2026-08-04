@@ -2,58 +2,91 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 name: Github Actions CI for PoA Miner
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:   # adds a manual "Run workflow" button
 env:
   SOURCE_ARTIFACT: source
+# Container jobs default run: steps to plain sh. Keep every step on bash so the
+# Linux/Windows jobs behave like the (hosted-runner) macOS job.
+defaults:
+  run:
+    shell: bash
 jobs:
   create-source-distribution:
     name: Create Source Distribution
-    runs-on: ubuntu-18.04
+    # No container: this job only tars the tree, so nothing here depends on the
+    # build image's glibc. Avoids the focal apt mirror entirely.
+    runs-on: ubuntu-latest
     env:
       ARTIFACT_DIR: source
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
-    # May need qt and protobuf to configure qt and include prcycoin-qt.1 in distribution
-    - name: Install Required Packages
-      run: |
-        sudo apt-get update
-        sudo apt-get install automake git make gcc
+      uses: actions/checkout@v5
     - name: Create Distribution Tarball
       run: |
         mkdir -p $ARTIFACT_DIR
         touch poaminer.tar.gz
-        tar -czf poaminer.tar.gz --exclude=poaminer.tar.gz .
+        tar -czf poaminer.tar.gz --exclude=poaminer.tar.gz --exclude=./.git .
     - name: Prepare Files for Artifact
       run: |
         mv poaminer.tar.gz $ARTIFACT_DIR
     - name: Upload Artifact
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v6
       with:
         name: ${{ env.SOURCE_ARTIFACT }}
         path: ${{ env.ARTIFACT_DIR }}
   build-x86_64-linux:
     name: Build for x86 Linux 64bit
     needs: create-source-distribution
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
     env:
       ARTIFACT_DIR: poaminer-x86_64-linux
-      TEST_LOG_ARTIFACT_DIR: test-logs
     steps:
+    - name: Prepare container (ubuntu:20.04 base image)
+      run: |
+        export DEBIAN_FRONTEND=noninteractive
+        # archive.ubuntu.com intermittently drops the base "focal" InRelease from
+        # Actions runners. apt-get update only WARNS on a failed index, so the
+        # install then runs against an incomplete list and reports things like
+        # "Package make has no installation candidate" -- make/autoconf/automake/
+        # libtool/pkg-config live only in the base pocket, never in -updates or
+        # -security, so a missed base index takes all of them out at once.
+        # Retry until a base-pocket sentinel actually resolves.
+        printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/99retries
+        # Retry update+install as one unit. apt-get update only WARNS when an
+        # index fails to fetch, so a dropped base "focal" index shows up later as
+        # "Package make has no installation candidate" -- make/autoconf/automake/
+        # libtool/pkg-config live only in the base pocket, never in -updates or
+        # -security, so one missed index takes all of them out at once. Retrying
+        # the install itself is what actually detects that.
+        n=0
+        until apt-get update && apt-get install -y \
+              ca-certificates curl wget \
+              build-essential gcc make autoconf automake libtool pkg-config \
+              binutils libcurl4-openssl-dev; do
+          n=$((n+1))
+          [ $n -ge 4 ] && { echo "apt failed after $n attempts"; exit 1; }
+          echo "apt failed (attempt $n) -- retrying"
+          sleep $((n * 10))
+        done
     - name: Getting Source
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v7
       with:
         name: ${{ env.SOURCE_ARTIFACT }}
+        path: ${{ env.SOURCE_ARTIFACT }}
     - name: Extract Archives
       run: |
         tar -xzf poaminer.tar.gz --strip-components=1
       working-directory: ${{ env.SOURCE_ARTIFACT }}
-    - name: Install Required Packages
+    - name: Build POA Miner
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libcurl4-openssl-dev
-    - name: Build POA Miner 
-      run: |
+        # automake is invoked with GNU strictness (AM_INIT_AUTOMAKE([gnu])), which
+        # requires a file called exactly README. The repo only has README.MD, so
+        # autogen.sh fails on a clean checkout. Provide it rather than fail here.
+        [ -f README ] || cp README.MD README
         ./autogen.sh
         ./configure CFLAGS="-O3"
         make -j$(nproc)
@@ -65,81 +98,126 @@ jobs:
         chmod +x $SOURCE_ARTIFACT/minerd
         mv $SOURCE_ARTIFACT/minerd $ARTIFACT_DIR/prcycoin-poa-minerd
     - name: Upload Artifact
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v6
       with:
         name: ${{ env.ARTIFACT_DIR }}
         path: ${{ env.ARTIFACT_DIR }}
   build-win64:
     name: Build for Win64
     needs: create-source-distribution
-    runs-on: ubuntu-18.04
+    # No container. This job cross-compiles to a PE binary, so the host glibc is
+    # irrelevant -- there is nothing to gain from ubuntu:20.04 here, and staying
+    # on the runner image avoids the focal apt mirror completely.
+    runs-on: ubuntu-latest
     env:
       ARTIFACT_DIR: poaminer-win64
     steps:
+    - name: Install Required Packages
+      run: |
+        export DEBIAN_FRONTEND=noninteractive
+        n=0
+        until sudo apt-get update && sudo apt-get install -y \
+              build-essential make autoconf automake libtool pkg-config perl \
+              g++-mingw-w64-x86-64 gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64; do
+          n=$((n+1))
+          [ $n -ge 4 ] && { echo "apt failed after $n attempts"; exit 1; }
+          echo "apt failed (attempt $n) -- retrying"
+          sleep $((n * 10))
+        done
     - name: Getting Source
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v7
       with:
         name: ${{ env.SOURCE_ARTIFACT }}
+        path: ${{ env.SOURCE_ARTIFACT }}
     - name: Extract Archives
       run: |
         tar -xzf poaminer.tar.gz --strip-components=1
       working-directory: ${{ env.SOURCE_ARTIFACT }}
-    - name: Install Required Packages
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y g++-mingw-w64-x86-64 gcc-mingw-w64-x86-64
+    # The mingw curl/jansson/pthreads static libs and headers are committed to
+    # the repo in win64_deps/, and build.sh already builds against them. The old
+    # job downloaded and rebuilt curl and pthreads-w32 from upstream tarballs on
+    # every run, which is both redundant and a standing dependency on two URLs
+    # this build does not control.
+    #
+    # win64_deps/bin/curl-config has an absolute prefix baked in from whenever it
+    # was generated, so point it at wherever the source actually landed. That is
+    # also what makes this work inside a container, where the workspace is at
+    # /__w/... and not /home/runner/work/...
     - name: Build POA Miner
       run: |
-        wget -N https://curl.haxx.se/download/curl-7.40.0.tar.gz && tar xzf curl-7.40.0.tar.gz
-        wget -N https://sourceware.org/pub/pthreads-win32/pthreads-w32-2-9-1-release.tar.gz && tar xzf pthreads-w32-2-9-1-release.tar.gz
-        DEPS="/home/runner/work/POA-Miner/POA-Miner/source/win64_deps"
-        DESTDIR=${DEPS}
-        cd curl-7.40.0
-        ./configure --with-winssl --enable-static --prefix=/ --host=x86_64-w64-mingw32 --disable-shared
-        sudo make
-        sudo make install
-        cd ../pthreads-w32-2-9-1-release/
-        cp config.h pthreads_win32_config.h
-        sudo make -f GNUmakefile CROSS="x86_64-w64-mingw32-" clean GC-static
-        cp libpthreadGC2.a ${DEPS}/lib/libpthread.a
-        cp pthread.h semaphore.h sched.h ${DEPS}/include
-        cd /home/runner/work/POA-Miner/POA-Miner/source
-        sudo ./build.sh
+        [ -f README ] || cp README.MD README
+        DEPS="$PWD/win64_deps"
+        sed -i "s|^prefix=.*|prefix=${DEPS}|" "${DEPS}/bin/curl-config"
+        chmod +x "${DEPS}/bin/curl-config"
+        autoreconf -fi -I"${DEPS}/share/aclocal"
+        ./configure --host=x86_64-w64-mingw32 \
+          --with-libcurl="${DEPS}" \
+          CFLAGS="-DWIN32 -DCURL_STATICLIB -O3 -std=c99 -I${DEPS}/include -DPTW32_STATIC_LIB" \
+          LDFLAGS="-static -L${DEPS}/lib"
+        make -j$(nproc)
       working-directory: ${{ env.SOURCE_ARTIFACT }}
     - name: Prepare Files for Artifact
       run: |
         mkdir -p $ARTIFACT_DIR
-        strip $SOURCE_ARTIFACT/minerd.exe
+        x86_64-w64-mingw32-strip $SOURCE_ARTIFACT/minerd.exe
         mv $SOURCE_ARTIFACT/minerd.exe $ARTIFACT_DIR/prcycoin-poa-minerd.exe
     - name: Upload Artifact
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v6
       with:
         name: ${{ env.ARTIFACT_DIR }}
         path: ${{ env.ARTIFACT_DIR }}
   build-mac:
     name: Build for Mac
     needs: create-source-distribution
-    runs-on: macos-10.15
+    # macos-13 has been removed, so that label never gets a runner and the job
+    # queues forever. macos-15-intel is the current x64 image, which keeps this
+    # producing the same Intel binary as before -- an x86_64 build still runs on
+    # Apple Silicon under Rosetta, whereas an arm64 build would not run on Intel
+    # Macs at all.
+    #
+    # If this ever queues too, switch to macos-latest (arm64). The build works
+    # there: configure matches arm64 via arm*-*-*, and the hand-written ARM
+    # assembly is gated on __arm__ && __APCS_32__ (32-bit only), so on aarch64 it
+    # compiles out and the portable C path is used. The artifact becomes arm64.
+    runs-on: macos-15-intel
     env:
       ARTIFACT_DIR: poaminer-mac
     steps:
     - name: Getting Source
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v7
       with:
         name: ${{ env.SOURCE_ARTIFACT }}
+        path: ${{ env.SOURCE_ARTIFACT }}
     - name: Extract Archives
       run: |
         tar -xzf poaminer.tar.gz --strip-components=1
       working-directory: ${{ env.SOURCE_ARTIFACT }}
     - name: Install Required Packages
       run: |
-        brew install automake zlib jansson make
-    - name: Build POA Miner 
+        # Deliberately NOT installing jansson. configure does
+        # AC_CHECK_LIB(jansson, json_loads) and, if it finds one, links -ljansson
+        # dynamically -- against Homebrew's libjansson.dylib, which end users do
+        # not have, so the published binary dies with a dyld "Library not loaded"
+        # error. With no system jansson it falls back to the bundled static
+        # compat/jansson/libjansson.a, which is what the Linux and Windows jobs
+        # already link. Keep it that way.
+        brew install automake autoconf libtool pkg-config
+        # curl-config ships with the command line tools; fall back to brew's
+        # keg-only curl if that ever stops being true.
+        if ! command -v curl-config >/dev/null 2>&1; then
+          brew install curl
+          echo "$(brew --prefix curl)/bin" >> "$GITHUB_PATH"
+        fi
+    - name: Build POA Miner
       run: |
+        # automake is invoked with GNU strictness (AM_INIT_AUTOMAKE([gnu])), which
+        # requires a file called exactly README. The repo only has README.MD, so
+        # autogen.sh fails on a clean checkout. Provide it rather than fail here.
+        [ -f README ] || cp README.MD README
         ./autogen.sh
         ./nomacro.pl
-        ./configure CFLAGS="-march=native"
-        make -j$(nproc)
+        ./configure CFLAGS="-O3"
+        make -j$(sysctl -n hw.ncpu)
       working-directory: ${{ env.SOURCE_ARTIFACT }}
     - name: Prepare Files for Artifact
       run: |
@@ -148,7 +226,7 @@ jobs:
         chmod +x $SOURCE_ARTIFACT/minerd
         mv $SOURCE_ARTIFACT/minerd $ARTIFACT_DIR/prcycoin-poa-minerd
     - name: Upload Artifact
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v6
       with:
         name: ${{ env.ARTIFACT_DIR }}
         path: ${{ env.ARTIFACT_DIR }}
